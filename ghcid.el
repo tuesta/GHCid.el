@@ -18,10 +18,29 @@
 (require 'project)
 (require 'ansi-color)
 
+(defgroup ghcid nil
+  "Interface for GHCid in Emacs."
+  :group 'languages
+  :prefix "ghcid-")
+
 ;;; * Configuration variables
-(defcustom ghcid-command "ghcid --no-status --color=always --command \"cabal repl $1--repl-options=-ferror-spans --repl-options=-fdiagnostics-color=always\" --allow-eval"
+(defcustom ghcid-command "ghcid --no-status --height=53 --color=always --command \"cabal repl $1--repl-options=-ferror-spans --repl-options=-fdiagnostics-color=always\" --allow-eval"
   "El comando básico para ejecutar ghcid."
   :type 'string
+  :group 'ghcid)
+
+(defcustom ghcid-compilation-finish-functions nil
+  "Lista de funciones a ejecutar cuando GHCid termina de mostrar la salida.
+Cada función recibe como argumento el buffer del proceso ghcid."
+  :type 'hook
+  :group 'ghcid)
+
+(defcustom ghcid-settle-time 0.05
+  "Segundos de silencio necesarios para disparar el hook.
+Cuando GHCid termina :realod, envía los resultados. Si el tiempo
+entre ráfagas de texto supera este valor, se asume que la salida ha
+finalizado y se ejecuta `ghcid-compilation-finish-functions`."
+  :type 'number
   :group 'ghcid)
 
 ;;; * Detect project
@@ -32,13 +51,14 @@
     default-directory))
 
 ;;; * GHCid
-(defvar-local ghcid-state 'loading)
+(defvar-local ghcid--state 'loading)
+(defvar-local ghcid--finish-timer nil)
 
 (defun ghcid--filter-loading (proc string)
   (let ((sentinel-regexp "\\(?:Ok\\|Failed\\), \\(?:.*modules? loaded\\|unloaded all modules\\)\\."))
     (if (string-match sentinel-regexp string)
         (let ((post (substring string (match-end 0))))
-          (setq ghcid-state 'reloading)
+          (setq ghcid--state 'reloading)
           (erase-buffer)
           (set-marker (process-mark proc) (point-min))
 
@@ -98,11 +118,26 @@
     (setq string (replace-regexp-in-string "\\`[ \t\n\r\\]+" "" string))
 
     (unless (string-empty-p string)
+      ;; Cancelar el timer si GHCid vuelve a enviar datos
+      (when ghcid--finish-timer
+        (cancel-timer ghcid--finish-timer))
+
       ;; INSERCIÓN MANUAL (Evitamos compilation-filter para que no rompa el color)
       (save-excursion
         (goto-char (process-mark proc))
         (insert (ansi-color-apply string))
         (set-marker (process-mark proc) (point)))
+
+      ;; (Re)iniciar el timer. Solo si pasan `ghcid-settle-time` segundos
+      ;; ejecutaremos el hook.
+      (setq ghcid--finish-timer
+            (run-with-timer ghcid-settle-time nil
+                            (lambda (b)
+                              (when (buffer-live-p b)
+                                (with-current-buffer b
+                                  (setq ghcid--finish-timer nil)
+                                  (run-hook-with-args 'ghcid-compilation-finish-functions b))))
+                            (process-buffer proc)))
 
       ;;; Flycheck interaction
       ;; (dolist (buf (buffer-list))
@@ -125,7 +160,7 @@
   (when (buffer-live-p (process-buffer proc))
     (with-current-buffer (process-buffer proc)
       (let ((inhibit-read-only t))
-        (pcase ghcid-state
+        (pcase ghcid--state
           ('loading (ghcid--filter-loading proc string))
           ('reloading (ghcid--filter-reloading proc string)))))))
 
@@ -189,7 +224,7 @@
 
           (setq-local next-error-function #'ghcid-next-error-wrapper)
 
-          (setq ghcid-state 'loading)
+          (setq ghcid--state 'loading)
           (set-process-filter (get-buffer-process outbuf) #'ghcid-main-filter)))))
 
 (defun ghcid-run-if-not-running ()
@@ -201,13 +236,20 @@
     (unless (and proc (process-live-p proc)) (ghcid))))
 
 (defun ghcid-next-error-wrapper (arg &optional reset)
-  "Mueve el punto al error en el buffer de ghcid y salta al código fuente.
-Resta 1 solo cuando RESET es activo para evitar saltarse el primer error."
+  "Si RESET es no-nil, intenta primero con el error en la posición actual (0)
+(lo correcto cuando GHCid muestra errores de archivos directamente).
+Si esto falla  reintenta navegando al siguiente error disponible
+(lo correcto cuando empieza con un 'All good' seguido de un error de <interactive>)."
   (interactive "p")
   (let ((n (if (and reset (> arg 0))
                (1- arg)
              arg)))
-    (compilation-next-error-function n reset)))
+    (condition-case nil
+        (compilation-next-error-function n reset)
+      ((error user-error)
+       (if (and reset (= arg 1))
+           (compilation-next-error-function arg reset)
+         (message "GHCid: No hay más errores"))))))
 
 ;;; * Flycheck error
 ;;; ** Es más molesto que útil, aunque funciona correctamente
@@ -244,7 +286,7 @@ Resta 1 solo cuando RESET es activo para evitar saltarse el primer error."
 ;;   :modes '(haskell-mode haskell-literate-mode))
 
 ;;; * REPl interaction
-(defun ghcid-send-line (&optional custom-prefix)
+(defun ghcid-mark-line-for-eval (&optional custom-prefix)
   "Convierte la línea actual en un comando de Ghcid."
   (interactive)
   (let* ((prefix (or custom-prefix "-- $>"))
@@ -271,7 +313,8 @@ Resta 1 solo cuando RESET es activo para evitar saltarse el primer error."
         (move-to-column (max (+ current-col lprefix) min-cursor) t)))
     ))
 
-(defun ghcid-send-selection (beg end)
+;; TODO no funciona correctamente cuando hay identación
+(defun ghcid-mark-region-for-eval (beg end)
   "Convierte la seleccion actual en un bloque de comandos."
   (interactive "r")
   (let* ((selection (buffer-substring-no-properties beg end))
