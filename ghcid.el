@@ -35,14 +35,6 @@ Cada función recibe como argumento el buffer del proceso ghcid."
   :type 'hook
   :group 'ghcid)
 
-(defcustom ghcid-settle-time 0.05
-  "Segundos de silencio necesarios para disparar el hook.
-Cuando GHCid termina :realod, envía los resultados. Si el tiempo
-entre ráfagas de texto supera este valor, se asume que la salida ha
-finalizado y se ejecuta `ghcid-compilation-finish-functions`."
-  :type 'number
-  :group 'ghcid)
-
 ;;; * Detect project
 (defun ghcid-get-project-root ()
   "Obtiene la raíz del proyecto usando project.el o el directorio actual."
@@ -65,7 +57,6 @@ finalizado y se ejecuta `ghcid-compilation-finish-functions`."
           (unless (string-empty-p (string-trim post))
             (ghcid--filter-reloading proc post)))
 
-      ;; Versión ultra-simple para color
       (let ((start (process-mark proc)))
         (insert (ansi-color-apply string))
         (set-marker (process-mark proc) (point))))))
@@ -75,42 +66,6 @@ finalizado y se ejecuta `ghcid-compilation-finish-functions`."
     ;; Detección de reinicio (OSC 0)
     (when (string-match "\e]0;" string)
       (erase-buffer)
-
-      ;; ========== LIMPIEZA COMPLETA ==========
-      ;; Estoy borrando todo lo que se pueda borra
-      ;; probablemente muchas cosas no son necesarias
-      ;; TODO debería investigar cuáles son necesarias
-      (when (fboundp 'compilation-forget-errors)
-        (compilation-forget-errors))
-
-      ;; Resetear contadores de errores
-      (setq-local compilation-num-errors-found 0)
-      (setq-local compilation-num-warnings-found 0)
-      (setq-local compilation-num-infos-found 0)
-
-      ;; Limpiar marcadores y estructuras de compilation
-      (setq-local compilation-current-error nil)
-      (setq-local compilation-last-error (copy-marker (point-min)))
-
-      (setq-local compilation-messages-start (point-min))
-
-      ;; Limpiar tabla hash de locations (si existe)
-      (when (boundp 'compilation-locs)
-        (setq-local compilation-locs (make-hash-table :test 'equal :weakness 'value)))
-
-      ;; Limpiar caché de directorios (si existe)
-      (when (boundp 'compilation--previous-directory-cache)
-        (setq-local compilation--previous-directory-cache nil))
-
-      ;; Resetear marcador de parsing (si existe)
-      (when (and (boundp 'compilation--parsed) (markerp compilation--parsed))
-        (move-marker compilation--parsed (point-min)))
-
-      ;; Limpiar overlay de flecha (si existe)
-      (when (and (boundp 'overlay-arrow-position) overlay-arrow-position)
-        (setq overlay-arrow-position nil))
-      ;; ========== LIMPIEZA COMPLETA ==========
-
       (set-marker (process-mark proc) (point-min)))
 
     ;; Limpieza de basura de terminal
@@ -118,36 +73,29 @@ finalizado y se ejecuta `ghcid-compilation-finish-functions`."
     (setq string (replace-regexp-in-string "\\`[ \t\n\r\\]+" "" string))
 
     (unless (string-empty-p string)
-      ;; Cancelar el timer si GHCid vuelve a enviar datos
+      ;; cancel-timer if more data is still being processed
       (when ghcid--finish-timer
         (cancel-timer ghcid--finish-timer))
 
-      ;; INSERCIÓN MANUAL (Evitamos compilation-filter para que no rompa el color)
+      ;; MANUAL INSERTION: We bypass `compilation-filter` to prevent it from
+      ;; interfering with ANSI colors or triggering the parser prematurely.
       (save-excursion
         (goto-char (process-mark proc))
         (insert (ansi-color-apply string))
         (set-marker (process-mark proc) (point)))
 
-      ;; (Re)iniciar el timer. Solo si pasan `ghcid-settle-time` segundos
-      ;; ejecutaremos el hook.
+      ;; (Re)start the timer. We use a 0-second timer to defer the execution
+      ;; until the next iteration of the Emacs event loop.
       (setq ghcid--finish-timer
-            (run-with-timer ghcid-settle-time nil
+            (run-with-timer 0 nil
                             (lambda (b)
                               (when (buffer-live-p b)
                                 (with-current-buffer b
+                                  (ghcid--trigger-atomic-scan b)
                                   (setq ghcid--finish-timer nil)
                                   (run-hook-with-args 'ghcid-compilation-finish-functions b))))
                             (process-buffer proc)))
 
-      ;;; Flycheck interaction
-      ;; (dolist (buf (buffer-list))
-      ;;   (with-current-buffer buf
-      ;;     (when (and (derived-mode-p 'haskell-mode)
-      ;;                (fboundp 'flycheck-mode)
-      ;;                flycheck-mode)
-      ;;       (flycheck-buffer))))
-
-      ;; Forzar scroll y vista arriba
       (save-selected-window
         (let ((win (get-buffer-window (current-buffer) t)))
           (when win
@@ -155,6 +103,50 @@ finalizado y se ejecuta `ghcid-compilation-finish-functions`."
               (goto-char (point-min))
               (set-window-start win (point-min))
               (set-window-point win (point-min)))))))))
+
+(defun ghcid--clean()
+  ;; TODO debería investigar cuáles son necesarias
+  (when (fboundp 'compilation-forget-errors)
+    (compilation-forget-errors))
+
+  ;; Resetear contadores de errores
+  (setq-local compilation-num-errors-found 0)
+  (setq-local compilation-num-warnings-found 0)
+  (setq-local compilation-num-infos-found 0)
+
+  ;; Limpiar marcadores y estructuras de compilation
+  (setq-local compilation-current-error nil)
+  (setq-local compilation-last-error (copy-marker (point-min)))
+
+  (setq-local compilation-messages-start (point-min))
+
+  ;; Limpiar tabla hash de locations (si existe)
+  (when (boundp 'compilation-locs)
+    (setq-local compilation-locs (make-hash-table :test 'equal :weakness 'value)))
+
+  ;; Limpiar caché de directorios (si existe)
+  (when (boundp 'compilation--previous-directory-cache)
+    (setq-local compilation--previous-directory-cache nil))
+
+  ;; Resetear marcador de parsing (si existe)
+  (when (and (boundp 'compilation--parsed) (markerp compilation--parsed))
+    (move-marker compilation--parsed (point-min)))
+
+  ;; Limpiar overlay de flecha (si existe)
+  (when (and (boundp 'overlay-arrow-position) overlay-arrow-position)
+    (setq overlay-arrow-position nil)))
+
+(defun ghcid--trigger-atomic-scan (buffer)
+  (with-current-buffer buffer
+    (let ((inhibit-read-only t))
+      (setq-local compilation-error-regexp-alist
+                  '(ghcid-eval ghcid-no-col-end ghcid-with-col-end ghcid-range ghcid-eval-info))
+
+      (ghcid--clean)
+
+      (compilation-parse-errors (point-min) (point-max))
+      (font-lock-flush)
+      (font-lock-ensure))))
 
 (defun ghcid-main-filter (proc string)
   (when (buffer-live-p (process-buffer proc))
@@ -167,40 +159,38 @@ finalizado y se ejecuta `ghcid-compilation-finish-functions`."
 ;; ==================================================
 ;;  COMPATIBLE: REGEX SPEC SIMPLE FORMAT
 ;; ==================================================
-
+;;; TODO file:(line1,col1)-(line2,col2):message
 (defconst ghcid--file-line-col "^\\([^< \t\n\r:]+\\):\\([0-9]+\\):\\([0-9]+\\)")
 
-(defconst ghcid--file-line-col-input (concat ghcid--file-line-col "\n\\(?:\\$>.*\n\\)*?<interactive>:[0-9]+:[0-9]+\\(?:-[0-9]+\\)?: "))
+(defconst ghcid--warning-or-error "\\(?:\\(warning\\)\\|error\\):")
 
-(defconst ghcid-eval-error (concat ghcid--file-line-col-input "error:"))
-(defconst ghcid-eval-error-spec
-  (list 'ghcid-eval-error ghcid-eval-error 1 2 3 2))
+(defconst ghcid--file-line-col-input
+  (concat ghcid--file-line-col "\n"
+          "\\(?:\\$>.*\n\\)*?"
+          "<interactive>:\\(?:[0-9:]+\\(?:-[0-9]+\\)?\\|([0-9,]+)-([0-9,]+)\\): "))
 
-(defconst ghcid-eval-warning (concat ghcid--file-line-col-input "warning:"))
-(defconst ghcid-eval-warning-spec
-  (list 'ghcid-eval-warning ghcid-eval-warning 1 2 3 1))
+(defconst ghcid-eval (concat ghcid--file-line-col-input ghcid--warning-or-error))
+(defconst ghcid-eval-spec
+  (list 'ghcid-eval ghcid-eval 1 2 3 (cons 4 nil)))
+
+(defconst ghcid-no-col-end (concat ghcid--file-line-col ": " ghcid--warning-or-error))
+(defconst ghcid-spec-no-col-end
+  (list 'ghcid-no-col-end ghcid-no-col-end 1 2 (cons 3 3) (cons 4 nil) nil))
+
+(defconst ghcid-with-col-end (concat ghcid--file-line-col "-\\([0-9]+\\): " ghcid--warning-or-error))
+(defconst ghcid-spec-with-col-end
+  (list 'ghcid-with-col-end ghcid-with-col-end 1 2 (cons 3 4) (cons 5 nil) nil))
+
+(defconst ghcid-range
+  (concat "^\\([^< \t\n\r:]+\\):(\\([0-9]+\\),\\([0-9]+\\))-(\\([0-9]+\\),\\([0-9]+\\)): " ghcid--warning-or-error))
+(defconst ghcid-spec-range
+  (list 'ghcid-range ghcid-range 1 (cons 2 4) (cons 3 5) (cons 6 nil)))
 
 (defconst ghcid-eval-info (concat ghcid--file-line-col "\n\\(?:\\$>.*\n\\)*\\($>.*\\)$"))
 (defconst ghcid-eval-info-spec
   (list 'ghcid-eval-info ghcid-eval-info 1 2 3 0))
 
-(defconst ghcid-error-no-col-end (concat ghcid--file-line-col ": error:"))
-(defconst ghcid-spec-error-no-col-end
-  (list 'ghcid-error-no-col-end ghcid-error-no-col-end 1 2 (cons 3 3) 2 nil))
-
-(defconst ghcid-error-with-col-end (concat ghcid--file-line-col "-\\([0-9]+\\): error:"))
-(defconst ghcid-spec-error-with-col-end
-  (list 'ghcid-error-with-col-end ghcid-error-with-col-end 1 2 (cons 3 4) 2 nil))
-
-(defconst ghcid-warning-no-col-end (concat ghcid--file-line-col ": warning:"))
-(defconst ghcid-spec-warning-no-col-end
-  (list 'ghcid-warning-no-col-end ghcid-warning-no-col-end 1 2 (cons 3 3) 1 nil))
-
-(defconst ghcid-warning-with-col-end (concat ghcid--file-line-col "-\\([0-9]+\\): warning:"))
-(defconst ghcid-spec-warning-with-col-end
-  (list 'ghcid-warning-with-col-end ghcid-warning-with-col-end 1 2 (cons 3 4) 1 nil))
-
-;;;###autoload
+;; ###autoload
 (defun ghcid ()
   "Lanza la sesión de GHCid, kill previous sesión if exists."
   (interactive)
@@ -214,13 +204,13 @@ finalizado y se ejecuta `ghcid-compilation-finish-functions`."
           (outbuf (compilation-start ghcid-command 'compilation-mode (lambda (mode) buf-name))))
         (with-current-buffer outbuf
 
-          (setq next-error-last-buffer (current-buffer)) ; Indica que este es el buffer de errores
+          (setq next-error-last-buffer (current-buffer))
 
           (setq-local compilation-error-regexp-alist-alist
-                      (list ghcid-eval-error-spec ghcid-eval-warning-spec ghcid-eval-info-spec ghcid-spec-error-no-col-end ghcid-spec-error-with-col-end ghcid-spec-warning-no-col-end ghcid-spec-warning-with-col-end))
+                      (list ghcid-eval-spec ghcid-spec-no-col-end ghcid-spec-with-col-end ghcid-spec-range ghcid-eval-info-spec))
 
-          (setq-local compilation-error-regexp-alist
-                      '(ghcid-eval-error ghcid-eval-warning ghcid-eval-info ghcid-error-no-col-end ghcid-error-with-col-end ghcid-warning-no-col-end ghcid-warning-with-col-end))
+          ;; No error detection
+          (setq-local compilation-error-regexp-alist nil)
 
           (setq-local next-error-function #'ghcid-next-error-wrapper)
 
@@ -250,40 +240,6 @@ Si esto falla  reintenta navegando al siguiente error disponible
        (if (and reset (= arg 1))
            (compilation-next-error-function arg reset)
          (message "GHCid: No hay más errores"))))))
-
-;;; * Flycheck error
-;;; ** Es más molesto que útil, aunque funciona correctamente
-;;; *** TODO diferenciar entre warnings y errors
-;; (defvar ghcid--error-regexp "^\\([^ \t\n\r:]+\\):\\([0-9]+\\):\\([0-9-]+\\):"
-;;   "Regex interna para reconocer errores de GHCid.")
-;; (flycheck-define-generic-checker 'ghcid-checker
-;;   "Un checker de Flycheck que extrae errores del buffer de Ghcid."
-;;   :start (lambda (_checker callback)
-;;            (let ((errors nil)
-;;                  (ghcid-buf (get-buffer "*ghcid*"))
-;;                  ;; Capturamos el buffer que Flycheck está analizando ahora
-;;                  (current-file-buffer (current-buffer)))
-;;              (when (and ghcid-buf (buffer-file-name current-file-buffer))
-;;                (with-current-buffer ghcid-buf
-;;                  (save-excursion
-;;                    (goto-char (point-min))
-;;                    (while (re-search-forward ghcid--error-regexp nil t)
-;;                      (let* ((file-path (match-string 1))
-;;                             (line (string-to-number (match-string 2)))
-;;                             (col-str (match-string 3))
-;;                             (col (string-to-number (car (split-string col-str "-"))))
-;;                             (msg (buffer-substring-no-properties (point) (line-end-position))))
-;;
-;;                        ;; Comparamos si el error pertenece al buffer que Flycheck está procesando
-;;                        (when (string-suffix-p (file-name-nondirectory file-path)
-;;                                               (buffer-file-name current-file-buffer))
-;;                          (push (flycheck-error-new-at line col 'error (string-trim msg)
-;;                                                       :checker 'ghcid-checker
-;;                                                       :buffer current-file-buffer)
-;;                                errors)))))))
-;;              (funcall callback 'finished errors)))
-;;
-;;   :modes '(haskell-mode haskell-literate-mode))
 
 ;;; * REPl interaction
 (defun ghcid-mark-line-for-eval (&optional custom-prefix)
