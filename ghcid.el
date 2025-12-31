@@ -159,7 +159,6 @@ Cada función recibe como argumento el buffer del proceso ghcid."
 ;; ==================================================
 ;;  COMPATIBLE: REGEX SPEC SIMPLE FORMAT
 ;; ==================================================
-;;; TODO file:(line1,col1)-(line2,col2):message
 (defconst ghcid--file-line-col "^\\([^< \t\n\r:]+\\):\\([0-9]+\\):\\([0-9]+\\)")
 
 (defconst ghcid--warning-or-error "\\(?:\\(warning\\)\\|error\\):")
@@ -190,7 +189,7 @@ Cada función recibe como argumento el buffer del proceso ghcid."
 (defconst ghcid-eval-info-spec
   (list 'ghcid-eval-info ghcid-eval-info 1 2 3 0))
 
-;; ###autoload
+;;;###autoload
 (defun ghcid ()
   "Lanza la sesión de GHCid, kill previous sesión if exists."
   (interactive)
@@ -269,29 +268,36 @@ Si esto falla  reintenta navegando al siguiente error disponible
         (move-to-column (max (+ current-col lprefix) min-cursor) t)))
     ))
 
-;; TODO no funciona correctamente cuando hay identación
 (defun ghcid-mark-region-for-eval (beg end)
   "Convierte la seleccion actual en un bloque de comandos."
   (interactive "r")
   (let* ((selection (buffer-substring-no-properties beg end))
          (start-offset (string-match "[^ \t\n\r]" selection))
          (end-offset (and start-offset
-                          (string-match "[ \t\n\r]*\\'" selection start-offset))))
-    (when start-offset
-      (save-excursion
-        (goto-char (+ beg end-offset))
-        (let ((post-text-point (point)))
-          (insert "\n<$ -}")
-          (unless (looking-at "[ \t]*$")
-            (insert "\n")))
+                          (string-match "[ \t\n\r]*\\'" selection start-offset)))
+         (char-beg (+ beg (or start-offset 0)))
+         (real-beg (copy-marker (save-excursion
+                                  (goto-char char-beg)
+                                  (skip-chars-backward " \t")
+                                  (point))))
+         (real-end (copy-marker (+ beg (or end-offset (length selection))) t))
+         (indent-count (save-excursion
+                (goto-char real-beg)
+                (beginning-of-line)
+                (- real-beg (point))))
+         (indent-spaces (make-string (max 0 (1- indent-count)) ?\s)))
 
-        (goto-char (+ beg start-offset))
-        (let ((pre-text-point (point)))
-          (insert "{- $>\n")
-          (save-excursion
-            (goto-char pre-text-point)
-            (unless (bolp)
-              (insert "\n"))))))))
+    (save-excursion
+      (goto-char real-end)
+      (insert "\n<$ -}")
+      (unless (eolp) (insert "\n"))
+      (insert indent-spaces)
+
+      (goto-char real-beg)
+      (insert "\n{- $>\n" indent-spaces (if (= indent-count 0) "" " ")))
+
+    (set-marker real-beg nil)
+    (set-marker real-end nil)))
 
 (provide 'ghcid)
 
