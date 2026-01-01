@@ -70,7 +70,7 @@ Cada función recibe como argumento el buffer del proceso ghcid."
 
     ;; Limpieza de basura de terminal
     (setq string (replace-regexp-in-string "\e].*?[\e\\]" "" string))
-    (setq string (replace-regexp-in-string "\\`[ \t\n\r\\]+" "" string))
+    (setq string (replace-regexp-in-string "\\`\\\\[ \t]*\n" "" string))
 
     (unless (string-empty-p string)
       ;; cancel-timer if more data is still being processed
@@ -139,6 +139,15 @@ Cada función recibe como argumento el buffer del proceso ghcid."
 (defun ghcid--trigger-atomic-scan (buffer)
   (with-current-buffer buffer
     (let ((inhibit-read-only t))
+      (save-excursion
+        (goto-char (point-min))
+        (when (looking-at "[ \t\n\r]+")
+          (delete-region (match-beginning 0) (match-end 0)))
+
+        (goto-char (point-max))
+        (skip-chars-backward " \t\n\r")
+        (delete-region (point) (point-max)))
+
       (setq-local compilation-error-regexp-alist
                   '(ghcid-eval ghcid-no-col-end ghcid-with-col-end ghcid-range ghcid-eval-info))
 
