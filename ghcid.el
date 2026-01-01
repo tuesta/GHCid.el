@@ -271,33 +271,77 @@ Si esto falla  reintenta navegando al siguiente error disponible
 (defun ghcid-mark-region-for-eval (beg end)
   "Convierte la seleccion actual en un bloque de comandos."
   (interactive "r")
-  (let* ((selection (buffer-substring-no-properties beg end))
+  (let* ((orig-point (point))
+         (selection (buffer-substring-no-properties beg end))
          (start-offset (string-match "[^ \t\n\r]" selection))
          (end-offset (and start-offset
                           (string-match "[ \t\n\r]*\\'" selection start-offset)))
-         (char-beg (+ beg (or start-offset 0)))
-         (real-beg (copy-marker (save-excursion
-                                  (goto-char char-beg)
-                                  (skip-chars-backward " \t")
-                                  (point))))
-         (real-end (copy-marker (+ beg (or end-offset (length selection))) t))
-         (indent-count (save-excursion
-                (goto-char real-beg)
-                (beginning-of-line)
-                (- real-beg (point))))
-         (indent-spaces (make-string (max 0 (1- indent-count)) ?\s)))
+         (real-text (if (and start-offset end-offset)
+                        (substring selection start-offset end-offset)
+                      ""))
+         (is-opening-present (string-prefix-p "{- $>" real-text))
+         (is-closing-present (string-suffix-p "<$ -}" real-text)))
+    (cond
+     ;; TOGGLE OFF
+     ((and is-opening-present is-closing-present)
+      (let* ((char-beg (+ beg start-offset))
+             (has-placeholder (string-match "{- \\$>\n[ \t]*_[ \t]*\n[ \t]*<\\$ -}" real-text)))
+          (goto-char char-beg)
+          (delete-region (line-beginning-position) (line-end-position))
+          (join-line)
+          (forward-char 1)
 
-    (save-excursion
-      (goto-char real-end)
-      (insert "\n<$ -}")
-      (unless (eolp) (insert "\n"))
-      (insert indent-spaces)
+          (if has-placeholder
+              (delete-region (line-beginning-position) (line-beginning-position 2))
+            (progn
+              (join-line)
+              (newline-and-indent)))
 
-      (goto-char real-beg)
-      (insert "\n{- $>\n" indent-spaces (if (= indent-count 0) "" " ")))
+          (back-to-indentation)
 
-    (set-marker real-beg nil)
-    (set-marker real-end nil)))
+          (save-excursion
+            (when (search-forward "<$ -}" nil t)
+              (delete-region (line-beginning-position) (line-end-position))
+              (join-line)))))
+     ;; TOGGLE ON
+     (t
+      (let* ((char-beg (if start-offset (+ beg start-offset) (point)))
+             (real-beg (copy-marker (save-excursion
+                                      (goto-char char-beg)
+                                      (skip-chars-backward " \t")
+                                      (point))))
+             (real-end (copy-marker
+                        (save-excursion
+                          (if end-offset (+ beg end-offset) (point)))
+                        t))
+             (indent-count (if (not start-offset)
+                               (current-column)
+                             (save-excursion (goto-char real-beg) (beginning-of-line) (- real-beg (point)))))
+             (indent-spaces (make-string (max 0 (1- indent-count)) ?\s))
+             (is-newline-at-start (eq ?\n (char-after real-beg))))
+        (goto-char real-end)
+
+        (if (and (eq ?\n (char-after orig-point)) (eq orig-point end))
+            (insert "\n<$ -}" indent-spaces)
+          (insert "\n<$ -}"))
+
+        (goto-char real-beg)
+
+        (unless (looking-back "^[ \t]*" (line-beginning-position)) (insert "\n"))
+
+        (insert "{- $>\n" indent-spaces)
+
+        (if (not start-offset)
+            (progn (insert "_") (backward-char 2))
+          (back-to-indentation))
+
+        (save-excursion
+          (goto-char real-end)
+          (unless (eq ?\n (char-after (point))) (insert "\n" indent-spaces)))
+
+        (set-marker real-beg nil)
+        (set-marker real-end nil))))
+    (deactivate-mark)))
 
 (provide 'ghcid)
 
