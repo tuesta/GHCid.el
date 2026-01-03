@@ -24,7 +24,8 @@
   :prefix "ghcid-")
 
 ;;; * Configuration variables
-(defcustom ghcid-command "ghcid --no-status --height=53 --color=always --command \"cabal repl $1--repl-options=-ferror-spans --repl-options=-fdiagnostics-color=always\" --allow-eval"
+;;; TODO: allow easier configuration of this command
+(defcustom ghcid-command "ghcid --no-status --signal --height=53 --color=always --command \"cabal repl $1--repl-options=-ferror-spans --repl-options=-fdiagnostics-color=always\" --allow-eval"
   "El comando básico para ejecutar ghcid."
   :type 'string
   :group 'ghcid)
@@ -43,69 +44,43 @@ Cada función recibe como argumento el buffer del proceso ghcid."
     default-directory))
 
 ;;; * GHCid
-(defvar-local ghcid--state 'loading)
-(defvar-local ghcid--finish-timer nil)
-
-(defun ghcid--filter-loading (proc string)
-  (let ((sentinel-regexp "\\(?:Ok\\|Failed\\), \\(?:.*modules? loaded\\|unloaded all modules\\)\\."))
-    (if (string-match sentinel-regexp string)
-        (let ((post (substring string (match-end 0))))
-          (setq ghcid--state 'reloading)
+(defun ghcid--filter (proc string)
+  (when (buffer-live-p (process-buffer proc))
+    (with-current-buffer (process-buffer proc)
+      (let ((inhibit-read-only t))
+        ;; Detección de reinicio (OSC 0)
+        (when (string-match "\e]0;" string)
           (erase-buffer)
           (set-marker (process-mark proc) (point-min))
+          (setq string (substring string (match-beginning 0))))
 
-          (unless (string-empty-p (string-trim post))
-            (ghcid--filter-reloading proc post)))
+        ;; Strip terminal artifacts
+        (setq string (replace-regexp-in-string "\e].*?[\e\\]" "" string))
+        (setq string (replace-regexp-in-string "^\\\\\n" "" string))
 
-      (let ((start (process-mark proc)))
-        (insert (ansi-color-apply string))
-        (set-marker (process-mark proc) (point))))))
+        (let ((has-finished-reloading (string-match-p "\x1c$" string)))
+          (unless (string-empty-p string)
+            (setq string (replace-regexp-in-string "\x1c$" "" string))
 
-(defun ghcid--filter-reloading (proc string)
-  (let ((inhibit-read-only t))
-    ;; Detección de reinicio (OSC 0)
-    (when (string-match "\e]0;" string)
-      (erase-buffer)
-      (set-marker (process-mark proc) (point-min)))
+            ;; MANUAL INSERTION: We bypass `compilation-filter` to prevent it from
+            ;; interfering with ANSI colors or triggering the parser prematurely.
+            (save-excursion
+              (goto-char (process-mark proc))
+              (insert (ansi-color-apply string))
+              (set-marker (process-mark proc) (point)))
 
-    ;; Limpieza de basura de terminal
-    (setq string (replace-regexp-in-string "\e].*?[\e\\]" "" string))
-    (setq string (replace-regexp-in-string "\\`\\\\[ \t]*\n" "" string))
+            (when has-finished-reloading (ghcid--sync-and-report))
 
-    (unless (string-empty-p string)
-      ;; cancel-timer if more data is still being processed
-      (when ghcid--finish-timer
-        (cancel-timer ghcid--finish-timer))
-
-      ;; MANUAL INSERTION: We bypass `compilation-filter` to prevent it from
-      ;; interfering with ANSI colors or triggering the parser prematurely.
-      (save-excursion
-        (goto-char (process-mark proc))
-        (insert (ansi-color-apply string))
-        (set-marker (process-mark proc) (point)))
-
-      ;; (Re)start the timer. We use a 0-second timer to defer the execution
-      ;; until the next iteration of the Emacs event loop.
-      (setq ghcid--finish-timer
-            (run-with-timer 0 nil
-                            (lambda (b)
-                              (when (buffer-live-p b)
-                                (with-current-buffer b
-                                  (ghcid--trigger-atomic-scan b)
-                                  (setq ghcid--finish-timer nil)
-                                  (run-hook-with-args 'ghcid-compilation-finish-functions b))))
-                            (process-buffer proc)))
-
-      (save-selected-window
-        (let ((win (get-buffer-window (current-buffer) t)))
-          (when win
-            (with-selected-window win
-              (goto-char (point-min))
-              (set-window-start win (point-min))
-              (set-window-point win (point-min)))))))))
+            (save-selected-window
+              (let ((win (get-buffer-window (current-buffer) t)))
+                (when win
+                  (with-selected-window win
+                    (goto-char (point-min))
+                    (set-window-start win (point-min))
+                    (set-window-point win (point-min))))))))))))
 
 (defun ghcid--clean()
-  ;; TODO debería investigar cuáles son necesarias
+;;; TODO: debería investigar cuáles son necesarias
   (when (fboundp 'compilation-forget-errors)
     (compilation-forget-errors))
 
@@ -136,34 +111,24 @@ Cada función recibe como argumento el buffer del proceso ghcid."
   (when (and (boundp 'overlay-arrow-position) overlay-arrow-position)
     (setq overlay-arrow-position nil)))
 
-(defun ghcid--trigger-atomic-scan (buffer)
-  (with-current-buffer buffer
-    (let ((inhibit-read-only t))
-      (save-excursion
-        (goto-char (point-min))
-        (when (looking-at "[ \t\n\r]+")
-          (delete-region (match-beginning 0) (match-end 0)))
+(defun ghcid--sync-and-report ()
+  (delete-blank-lines)
+  (goto-char (point-min))
+  (when (looking-at "[ \t\n\r]+")
+    (delete-region (match-beginning 0) (match-end 0)))
 
-        (goto-char (point-max))
-        (skip-chars-backward " \t\n\r")
-        (delete-region (point) (point-max)))
+  (setq-local compilation-error-regexp-alist
+              '(ghcid-eval ghcid-no-col-end ghcid-with-col-end ghcid-range ghcid-eval-info))
 
-      (setq-local compilation-error-regexp-alist
-                  '(ghcid-eval ghcid-no-col-end ghcid-with-col-end ghcid-range ghcid-eval-info))
+  (ghcid--clean)
 
-      (ghcid--clean)
+  (compilation-parse-errors (point-min) (point-max))
+  (font-lock-flush)
+  (font-lock-ensure)
 
-      (compilation-parse-errors (point-min) (point-max))
-      (font-lock-flush)
-      (font-lock-ensure))))
+  (setq-local compilation-error-regexp-alist nil)
 
-(defun ghcid-main-filter (proc string)
-  (when (buffer-live-p (process-buffer proc))
-    (with-current-buffer (process-buffer proc)
-      (let ((inhibit-read-only t))
-        (pcase ghcid--state
-          ('loading (ghcid--filter-loading proc string))
-          ('reloading (ghcid--filter-reloading proc string)))))))
+  (run-hook-with-args 'ghcid-compilation-finish-functions (current-buffer)))
 
 ;; ==================================================
 ;;  COMPATIBLE: REGEX SPEC SIMPLE FORMAT
@@ -223,7 +188,7 @@ Cada función recibe como argumento el buffer del proceso ghcid."
           (setq-local next-error-function #'ghcid-next-error-wrapper)
 
           (setq ghcid--state 'loading)
-          (set-process-filter (get-buffer-process outbuf) #'ghcid-main-filter)))))
+          (set-process-filter (get-buffer-process outbuf) #'ghcid--filter)))))
 
 (defun ghcid-run-if-not-running ()
   "Lanza la sesión de Ghcid si no hay una activa."
@@ -250,6 +215,7 @@ Si esto falla  reintenta navegando al siguiente error disponible
          (message "GHCid: No hay más errores"))))))
 
 ;;; * REPl interaction
+;;; TODO: only works if at the beginning of the line
 (defun ghcid-mark-line-for-eval (&optional custom-prefix)
   "Convierte la línea actual en un comando de Ghcid."
   (interactive)
@@ -274,8 +240,7 @@ Si esto falla  reintenta navegando al siguiente error disponible
     (let ((min-cursor (+ (length indent) lprefix)))
       (if has-prefix
           (move-to-column (max current-col min-cursor) t)
-        (move-to-column (max (+ current-col lprefix) min-cursor) t)))
-    ))
+        (move-to-column (max (+ current-col lprefix) min-cursor) t)))))
 
 (defun ghcid-mark-region-for-eval (beg end)
   "Convierte la seleccion actual en un bloque de comandos."
